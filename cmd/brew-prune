@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Find and interactively uninstall Homebrew casks whose app targets are missing."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+from typing import Any
+
+
+def brew_output(*args: str) -> str:
+    result = subprocess.run(
+        ["brew", *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def load_json(path: pathlib.Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("expected a JSON object")
+    return value
+
+
+def cask_uninstall_name(token: str, receipt: dict[str, Any]) -> str:
+    source = receipt.get("source", {})
+    tap = source.get("tap") if isinstance(source, dict) else None
+    if tap and tap != "homebrew/cask":
+        return f"{tap}/{token}"
+    return token
+
+
+def expected_app_paths(
+    receipt: dict[str, Any], config: dict[str, Any]
+) -> list[pathlib.Path]:
+    explicit = config.get("explicit", {})
+    env_config = config.get("env", {})
+    defaults = config.get("default", {})
+
+    appdir_value = "/Applications"
+    for group in (explicit, env_config, defaults):
+        if isinstance(group, dict) and group.get("appdir"):
+            appdir_value = str(group["appdir"])
+            break
+
+    appdir = pathlib.Path(os.path.expandvars(os.path.expanduser(appdir_value)))
+    paths: list[pathlib.Path] = []
+
+    for artifact in receipt.get("uninstall_artifacts", []):
+        if not isinstance(artifact, dict) or "app" not in artifact:
+            continue
+
+        target = artifact.get("target")
+        if isinstance(target, str) and target:
+            raw_targets = [target]
+        else:
+            app_entries = artifact.get("app", [])
+            if isinstance(app_entries, str):
+                app_entries = [app_entries]
+            if not isinstance(app_entries, list):
+                continue
+            raw_targets = [
+                entry for entry in app_entries if isinstance(entry, str) and entry
+            ]
+
+        for raw in raw_targets:
+            path = pathlib.Path(os.path.expandvars(os.path.expanduser(raw)))
+            if not path.is_absolute():
+                # An app artifact's source may be nested inside the downloaded
+                # archive; its installed destination defaults to the app name.
+                path = appdir / (path.name if not target else path)
+            paths.append(path)
+
+    # Preserve order while removing duplicate destinations.
+    return list(dict.fromkeys(paths))
+
+
+def main() -> int:
+    print("==> Checking installed casks for missing app artifacts...", flush=True)
+    try:
+        caskroom = pathlib.Path(brew_output("--caskroom"))
+        installed_names = set(brew_output("list", "--cask", "--full-name").splitlines())
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"无法读取 Homebrew 状态：{error}", file=sys.stderr)
+        return 2
+
+    receipts = sorted(caskroom.glob("*/.metadata/INSTALL_RECEIPT.json"))
+    candidates: list[tuple[str, str, list[pathlib.Path]]] = []
+
+    for receipt_path in receipts:
+        token = receipt_path.parents[1].name
+        config_path = receipt_path.parent / "config.json"
+        try:
+            receipt = load_json(receipt_path)
+            config = load_json(config_path) if config_path.exists() else {}
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            print(f"跳过 {token}：安装收据无法读取（{error}）", file=sys.stderr)
+            continue
+
+        brew_name = cask_uninstall_name(token, receipt)
+        if brew_name not in installed_names and token not in installed_names:
+            continue
+
+        paths = expected_app_paths(receipt, config)
+        if not paths:
+            continue  # CLI tools, fonts, pkg-only casks, and other non-app casks.
+
+        missing = [path for path in paths if not path.exists()]
+        if len(missing) == len(paths):
+            candidates.append((token, brew_name, paths))
+        elif missing:
+            print(
+                f"保留 {token}：存在的 App 目标为 "
+                + ", ".join(str(path) for path in paths if path.exists())
+            )
+
+    if not candidates:
+        print("==> No casks with all declared app paths missing were found.")
+        return 0
+
+    print("Warning: The following casks have all declared app paths missing:")
+    for token, _brew_name, paths in candidates:
+        print(f"  {token}: " + ", ".join(str(path) for path in paths))
+
+    try:
+        answer = input("Uninstall these casks? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in {"y", "yes"}:
+        print("==> Skipped; no casks were uninstalled.")
+        return 0
+
+    env = os.environ.copy()
+    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+    env["HOMEBREW_NO_ENV_HINTS"] = "1"
+
+    failures = 0
+    for token, brew_name, _paths in candidates:
+        print(f"\n==> Uninstalling cask {token}...", flush=True)
+        result = subprocess.run(
+            ["brew", "uninstall", "--cask", "--force", brew_name],
+            env=env,
+            check=False,
+        )
+        if result.returncode == 0:
+            print(f"🍺  {token} was successfully uninstalled.")
+        else:
+            failures += 1
+            print(
+                f"Error: {token} uninstall failed with exit code "
+                f"{result.returncode}; see the output above.",
+                file=sys.stderr,
+            )
+
+    if failures:
+        print(f"Error: {failures} cask(s) failed to uninstall.", file=sys.stderr)
+        return 1
+    print(f"==> Uninstalled {len(candidates)} cask(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
